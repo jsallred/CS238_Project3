@@ -35,6 +35,15 @@ insert(struct avl *avl, const char *s)
 }
 
 static int
+remove_word(struct avl *avl, const char *s)
+{
+	if (avl_remove(avl, s)) {
+		printf("'%s' does not exist\n", s);
+	}
+	return 0;
+}
+
+static int
 load(struct avl *avl, const char *s)
 {
 	char word[256];
@@ -105,6 +114,7 @@ help(struct avl *avl, const char *s)
 	       "  list          : list words in sorted order\n"
 	       "  load pathname : load words from file @ 'pathname'\n"
 	       "  insert word   : insert 'word'\n"
+	       "  remove word   : remove one 'word'\n"
 	       "  exists word   : check if 'word' exists\n"
 	       "\n");
 	return 0;
@@ -133,6 +143,7 @@ shell_fnc(void *arg, const char *s)
 		{ 0, "list", list },
 		{ 1, "load", load },
 		{ 1, "insert", insert },
+		{ 1, "remove", remove_word },
 		{ 1, "exists", exists }
 	};
 	struct avl *avl;

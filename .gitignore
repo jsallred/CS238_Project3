@@ -1,0 +1,18 @@
+# Build output
+*.o
+*.d
+*.so
+cs238
+
+# Test binary and scratch files
+tests/test_extra
+tests/*.o
+*.scm
+test_words.txt
+test_delete_me.txt
+
+# Editor and OS
+*~
+*#
+.DS_Store
+Thumbs.db

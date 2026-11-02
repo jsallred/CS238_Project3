@@ -95,6 +95,7 @@ update(struct avl *avl, struct node *root, const char *item)
 		}
 		memset(root, 0, sizeof (struct node));
 		if (!(root->item = scm_strdup(avl->scm, item))) {
+			scm_free(avl->scm, root);
 			TRACE(0);
 			return NULL;
 		}
@@ -141,6 +142,92 @@ traverse(struct node *node, avl_fnc_t fnc, void *arg)
 		fnc(arg, node->item, node->count);
 		traverse(node->right, fnc, arg);
 	}
+}
+
+static struct node *
+rebalance(struct node *root)
+{
+	int b;
+
+	if (!root) {
+		return NULL;
+	}
+	root->depth = depth(root->left, root->right);
+	b = balance(root);
+	if (1 < b) {
+		if (0 > balance(root->left)) {
+			root = rotate_left_right(root);
+		}
+		else {
+			root = rotate_right(root);
+		}
+	}
+	else if (-1 > b) {
+		if (0 < balance(root->right)) {
+			root = rotate_right_left(root);
+		}
+		else {
+			root = rotate_left(root);
+		}
+	}
+	return root;
+}
+
+/* Unlink the minimum node and return the rebalanced remainder. */
+static struct node *
+detach_min(struct node *root, struct node **min)
+{
+	assert( root );
+
+	if (!root->left) {
+		*min = root;
+		return root->right;
+	}
+	root->left = detach_min(root->left, min);
+	return rebalance(root);
+}
+
+static struct node *
+remove_rec(struct avl *avl, struct node *root, const char *item, int *found)
+{
+	int d;
+	struct node *child;
+	struct node *succ;
+	const char *old;
+
+	if (!root) {
+		return NULL;
+	}
+	d = strcmp(item, root->item);
+	if (0 > d) {
+		root->left = remove_rec(avl, root->left, item, found);
+	}
+	else if (0 < d) {
+		root->right = remove_rec(avl, root->right, item, found);
+	}
+	else {
+		*found = 1;
+		if (1 < root->count) {
+			--root->count;
+			--avl->state->items;
+			return root;
+		}
+		--avl->state->items;
+		--avl->state->unique;
+		if (!root->left || !root->right) {
+			child = root->left ? root->left : root->right;
+			scm_free(avl->scm, (void *)root->item);
+			scm_free(avl->scm, root);
+			return child;
+		}
+		root->right = detach_min(root->right, &succ);
+		old = root->item;
+		root->item = succ->item;
+		root->count = succ->count;
+		scm_free(avl->scm, (void *)old);
+		scm_free(avl->scm, succ);
+	}
+	return rebalance(root);
 }
 
 struct avl *
@@ -200,6 +287,19 @@ avl_insert(struct avl *avl, const char *item)
 	}
 	avl->state->root = root;
 	return 0;
+}
+
+int
+avl_remove(struct avl *avl, const char *item)
+{
+	int found;
+
+	assert( avl );
+	assert( safe_strlen(item) );
+
+	found = 0;
+	avl->state->root = remove_rec(avl, avl->state->root, item, &found);
+	return found ? 0 : -1;
 }
 
 uint64_t
