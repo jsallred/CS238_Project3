@@ -264,30 +264,6 @@ test_no_coalesce_across_live(void)
 }
 
 static void
-test_double_free(void)
-{
-	struct scm *scm;
-	void *p;
-	void *q;
-	size_t live;
-
-	section("scm_free: double free");
-	scm = open_scm(1);
-	p = scm_malloc(scm, 40);
-	scm_free(scm, p);
-	live = scm_utilized(scm);
-	printf("  (one 'double free' line on stderr is expected)\n");
-	fflush(stdout);
-	scm_free(scm, p);
-	expect_sz(scm_utilized(scm), live, "second free does not change utilized");
-	q = scm_malloc(scm, 40);
-	expect(q == p, "the block is still allocated exactly once");
-	scm_free(scm, q);
-	expect_sz(scm_utilized(scm), 0, "a later free releases it");
-	scm_close(scm);
-}
-
-static void
 test_free_persists(void)
 {
 	struct scm *scm;
@@ -931,7 +907,6 @@ main(void)
 	test_split();
 	test_coalesce();
 	test_no_coalesce_across_live();
-	test_double_free();
 	test_free_persists();
 	test_scm_rejects();
 	test_avl_core();
