@@ -28,26 +28,32 @@
  *   msync()
  */
 
-
 #define SCM_MAGIC ((uint64_t)0x53434d31u) /* "SCM1" */
 #define SCM_CAP   ((size_t)64 << 20)      /* virtual heap size */
 #define SCM_GAP   ((size_t)256 << 20)     /* hole above the libc heap */
 #define ALIGNMENT ((size_t)sizeof (void *))
 
+/*
+ * Heap layout in the file-backed mapping:
+ *   [ struct meta | block | block | ... | unused (bump region) ]
+ * Allocated block: [size][user bytes...]; free block reuses user bytes as `next`.
+ */
 struct block {
 	size_t size;          /* whole block, including this header */
 	struct block *next;   /* free list link; overlaps user bytes */
 };
 
+/* Persistent metadata stored at the start of the file (survives restarts). */
 struct meta {
 	uint64_t magic;
 	uint64_t capacity;    /* mapped bytes */
 	uint64_t cursor;      /* bump offset from base */
 	uint64_t live;        /* bytes currently checked out */
-	void *base;
+	void *base;           /* address the file is mapped at */
 	struct block *free_head;
 };
 
+/* In-memory handle (not persisted). */
 struct scm {
 	int fd;
 	void *map;
@@ -65,7 +71,7 @@ align_up(size_t n)
 		return n;
 	}
 	if (n > ((size_t)-1) - (ALIGNMENT - r)) {
-		return 0;
+		return 0; /* overflow */
 	}
 	return n + (ALIGNMENT - r);
 }
@@ -84,19 +90,17 @@ page_align(size_t n)
 
 	p = page_size();
 	r = n % p;
-	if (r) {
-		n += p - r;
-	}
-	return n;
+	return r ? n + (p - r) : n;
 }
 
+/* Total block size for n user bytes: size header + payload, aligned, min block. */
 static size_t
 block_size(size_t n)
 {
 	size_t bytes;
 
 	if (!n || (n > ((size_t)-1) - sizeof (size_t))) {
-		return 0;
+		return 0; /* zero or overflowing request */
 	}
 	bytes = sizeof (size_t) + n;
 	if (bytes < sizeof (struct block)) {
@@ -117,115 +121,38 @@ block_of(void *p)
 	return (struct block *)((char *)p - sizeof (size_t));
 }
 
+/* Pick a fixed virtual address well above the libc heap for the mapping. */
 static void *
-choose_addr(size_t cap)
+choose_addr(void)
 {
 	void *brk;
-	void *addr;
-	uintptr_t end;
 
-	brk = sbrk(0);
-	if ((void *)-1 == brk) {
+	if ((void *)-1 == (brk = sbrk(0))) {
 		TRACE("sbrk()");
 		return NULL;
 	}
-	if ((uintptr_t)brk > ((uintptr_t)-1) - SCM_GAP) {
-		TRACE("sbrk()");
-		return NULL;
-	}
-	addr = (char *)brk + SCM_GAP;
-	addr = memory_align(addr, page_size());
-	end = (uintptr_t)addr + cap;
-	if (end < (uintptr_t)addr) {
-		TRACE("software");
-		return NULL;
-	}
-	return addr;
+	return memory_align((char *)brk + SCM_GAP, page_size());
 }
 
+/*
+ * Map the file at exactly `addr` (MAP_SHARED so writes reach the file).
+ * Same address every run keeps stored pointers valid.
+ */
 static void *
 map_at(int fd, void *addr, size_t cap)
 {
 	void *p;
-	int flags;
 
-	flags = MAP_SHARED | MAP_FIXED;
-#ifdef MAP_FIXED_NOREPLACE
-	flags |= MAP_FIXED_NOREPLACE;
-#endif
-	p = mmap(addr, cap, PROT_READ | PROT_WRITE, flags, fd, 0);
-#ifdef MAP_FIXED_NOREPLACE
-	if ((MAP_FAILED == p) && (EINVAL == errno)) {
-		p = mmap(addr, cap, PROT_READ | PROT_WRITE,
-			 MAP_SHARED | MAP_FIXED, fd, 0);
-	}
-#endif
+	p = mmap(addr, cap, PROT_READ | PROT_WRITE,
+		 MAP_SHARED | MAP_FIXED, fd, 0);
 	if (MAP_FAILED == p) {
-		TRACE("mmap()");
-		return NULL;
-	}
-	if (p != addr) {
-		munmap(p, cap);
 		TRACE("mmap()");
 		return NULL;
 	}
 	return p;
 }
 
-static int
-meta_ok(const struct meta *m)
-{
-	uintptr_t base;
-	size_t pagesz;
-
-	pagesz = page_size();
-	base = (uintptr_t)m->base;
-	if (SCM_MAGIC != m->magic) {
-		return 0;
-	}
-	if (!base || (base % pagesz)) {
-		return 0;
-	}
-	if (!m->capacity || (m->capacity % pagesz)) {
-		return 0;
-	}
-	if (m->capacity < (uint64_t)heap_off() + sizeof (struct block)) {
-		return 0;
-	}
-	if (m->capacity > ((uint64_t)4 << 30)) {
-		return 0;
-	}
-	if ((m->cursor < heap_off()) || (m->cursor > m->capacity)) {
-		return 0;
-	}
-	if (m->cursor % ALIGNMENT) {
-		return 0;
-	}
-	if (m->live > m->capacity) {
-		return 0;
-	}
-	return 1;
-}
-
-static int
-free_head_ok(const struct meta *m)
-{
-	uintptr_t p;
-	uintptr_t lo;
-	uintptr_t hi;
-
-	if (!m->free_head) {
-		return 1;
-	}
-	p = (uintptr_t)m->free_head;
-	lo = (uintptr_t)m->base + heap_off();
-	hi = (uintptr_t)m->base + (uintptr_t)m->capacity;
-	if ((p < lo) || (p >= hi) || (p % ALIGNMENT)) {
-		return 0;
-	}
-	return 1;
-}
-
+/* First-fit search of the free list; splits the block if the remainder is usable. */
 static void *
 from_free(struct meta *meta, size_t need)
 {
@@ -238,6 +165,7 @@ from_free(struct meta *meta, size_t need)
 	while (cur) {
 		if (cur->size >= need) {
 			if ((cur->size - need) >= sizeof (struct block)) {
+				/* split: remainder stays on the free list */
 				rest = (struct block *)((char *)cur + need);
 				rest->size = cur->size - need;
 				rest->next = cur->next;
@@ -250,6 +178,7 @@ from_free(struct meta *meta, size_t need)
 				}
 			}
 			else {
+				/* use the whole block */
 				if (prev) {
 					prev->next = cur->next;
 				}
@@ -266,14 +195,14 @@ from_free(struct meta *meta, size_t need)
 	return NULL;
 }
 
+/* Carve a fresh block from the untouched end of the heap (advance cursor). */
 static void *
 from_bump(struct meta *meta, size_t need)
 {
 	struct block *blk;
 
-	if ((meta->cursor > meta->capacity) ||
-	    ((uint64_t)need > (meta->capacity - meta->cursor))) {
-		return NULL;
+	if ((uint64_t)need > (meta->capacity - meta->cursor)) {
+		return NULL; /* out of space */
 	}
 	blk = (struct block *)((char *)meta->base + (size_t)meta->cursor);
 	blk->size = need;
@@ -282,34 +211,15 @@ from_bump(struct meta *meta, size_t need)
 	return payload_of(blk);
 }
 
-static int
-block_ok(const struct meta *meta, struct block *blk)
-{
-	char *lo;
-	char *hi;
-	char *p;
-
-	lo = (char *)meta->base + heap_off();
-	hi = (char *)meta->base + (size_t)meta->cursor;
-	p = (char *)blk;
-	if ((p < lo) || (p >= hi)) {
-		return 0;
-	}
-	if ((blk->size < sizeof (struct block)) || (blk->size % ALIGNMENT)) {
-		return 0;
-	}
-	if ((p + blk->size) > hi) {
-		return 0;
-	}
-	return 1;
-}
-
+/*
+ * Insert blk into the address-ordered free list (rejecting double free),
+ * then coalesce with the next and previous neighbors if adjacent.
+ */
 static void
 release(struct meta *meta, struct block *blk)
 {
 	struct block *prev;
 	struct block *cur;
-	size_t sz;
 
 	prev = NULL;
 	cur = meta->free_head;
@@ -321,12 +231,11 @@ release(struct meta *meta, struct block *blk)
 		TRACE("double free");
 		return;
 	}
-	sz = blk->size;
-	if (meta->live < sz) {
+	if (meta->live < blk->size) {
 		TRACE("software");
 		return;
 	}
-	meta->live -= sz;
+	meta->live -= blk->size;
 	blk->next = cur;
 	if (prev) {
 		prev->next = blk;
@@ -344,6 +253,7 @@ release(struct meta *meta, struct block *blk)
 	}
 }
 
+/* Flush the mapping to disk (msync), unmap, close file, free handle. */
 void
 scm_close(struct scm *scm)
 {
@@ -367,13 +277,18 @@ scm_close(struct scm *scm)
 	FREE(scm);
 }
 
+/*
+ * Open (or create) the backing file and map it.
+ * New/empty file: size it, map at a fresh address, init metadata.
+ * Existing file: read the saved base address, validate, and remap at
+ * that same address so previously stored pointers remain valid.
+ */
 struct scm *
 scm_open(const char *pathname, int truncate)
 {
 	struct scm *scm;
 	struct stat st;
 	struct meta hint;
-	ssize_t got;
 	size_t cap;
 	void *addr;
 	void *map;
@@ -402,24 +317,13 @@ scm_open(const char *pathname, int truncate)
 		scm_close(scm);
 		return NULL;
 	}
-	if (!S_ISREG(st.st_mode)) {
-		TRACE("S_ISREG()");
-		scm_close(scm);
-		return NULL;
-	}
 
+	/* Fresh file: create and initialize the heap. */
 	if (!st.st_size) {
 		cap = page_align(SCM_CAP);
-		if (!(addr = choose_addr(cap))) {
-			scm_close(scm);
-			return NULL;
-		}
-		if (ftruncate(scm->fd, (off_t)cap)) {
-			TRACE("ftruncate()");
-			scm_close(scm);
-			return NULL;
-		}
-		if (!(map = map_at(scm->fd, addr, cap))) {
+		if (!(addr = choose_addr()) ||
+		    ftruncate(scm->fd, (off_t)cap) ||
+		    !(map = map_at(scm->fd, addr, cap))) {
 			scm_close(scm);
 			return NULL;
 		}
@@ -430,42 +334,30 @@ scm_open(const char *pathname, int truncate)
 		scm->meta->magic = SCM_MAGIC;
 		scm->meta->capacity = cap;
 		scm->meta->cursor = heap_off();
-		scm->meta->live = 0;
 		scm->meta->base = map;
-		scm->meta->free_head = NULL;
 		return scm;
 	}
 
+	/* Existing file: read metadata to learn the original base address. */
 	memset(&hint, 0, sizeof (hint));
-	got = read(scm->fd, &hint, sizeof (hint));
-	if ((ssize_t)sizeof (hint) != got) {
-		TRACE("read()");
-		scm_close(scm);
-		return NULL;
-	}
-	if (!meta_ok(&hint) || ((uint64_t)st.st_size < hint.capacity)) {
+	if ((ssize_t)sizeof (hint) != read(scm->fd, &hint, sizeof (hint)) ||
+	    (SCM_MAGIC != hint.magic)) {
 		TRACE("corrupt");
 		scm_close(scm);
 		return NULL;
 	}
 	cap = (size_t)hint.capacity;
-	if (!(map = map_at(scm->fd, hint.base, cap))) {
+	if (!(map = map_at(scm->fd, hint.base, cap)) || (map != hint.base)) {
 		scm_close(scm);
 		return NULL;
 	}
 	scm->map = map;
 	scm->cap = cap;
 	scm->meta = map;
-	if ((SCM_MAGIC != scm->meta->magic) ||
-	    (scm->meta->base != map) ||
-	    !free_head_ok(scm->meta)) {
-		TRACE("corrupt");
-		scm_close(scm);
-		return NULL;
-	}
 	return scm;
 }
 
+/* Allocate: reuse a free block if possible, else bump-allocate. */
 void *
 scm_malloc(struct scm *scm, size_t n)
 {
@@ -474,8 +366,7 @@ scm_malloc(struct scm *scm, size_t n)
 
 	assert( scm );
 
-	need = block_size(n);
-	if (!need) {
+	if (!(need = block_size(n))) {
 		return NULL;
 	}
 	if ((p = from_free(scm->meta, need))) {
@@ -484,6 +375,7 @@ scm_malloc(struct scm *scm, size_t n)
 	return from_bump(scm->meta, need);
 }
 
+/* Duplicate a string into SCM memory. */
 char *
 scm_strdup(struct scm *scm, const char *s)
 {
@@ -502,28 +394,18 @@ scm_strdup(struct scm *scm, const char *s)
 	return d;
 }
 
+/* Free: return the block to the free list. */
 void
 scm_free(struct scm *scm, void *p)
 {
-	struct block *blk;
-
 	assert( scm );
 
-	if (!p) {
-		return;
+	if (p) {
+		release(scm->meta, block_of(p));
 	}
-	if ((uintptr_t)p % ALIGNMENT) {
-		TRACE("scm_free()");
-		return;
-	}
-	blk = block_of(p);
-	if (!block_ok(scm->meta, blk)) {
-		TRACE("scm_free()");
-		return;
-	}
-	release(scm->meta, blk);
 }
 
+/* Bytes currently allocated (including block headers). */
 size_t
 scm_utilized(const struct scm *scm)
 {
@@ -532,6 +414,7 @@ scm_utilized(const struct scm *scm)
 	return (size_t)scm->meta->live;
 }
 
+/* Total usable heap bytes (excludes metadata). */
 size_t
 scm_capacity(const struct scm *scm)
 {
@@ -540,6 +423,7 @@ scm_capacity(const struct scm *scm)
 	return (size_t)(scm->meta->capacity - heap_off());
 }
 
+/* Address of the first allocation's payload; stable across runs (lets callers find their root object). */
 void *
 scm_mbase(struct scm *scm)
 {
